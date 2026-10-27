@@ -38,7 +38,11 @@ pub enum Event {
     /// Our proof was sent to a peer (local send completion, not confirmed delivery).
     ProofSent { peer: PeerId },
     /// Received a proof from a peer.
-    ProofReceived { peer: PeerId, proof_bytes: Bytes },
+    ProofReceived {
+        peer: PeerId,
+        connection_id: ConnectionId,
+        proof_bytes: Bytes,
+    },
     /// Failed to send our proof to a peer.
     ProofSendFailed { peer: PeerId, error: Error },
 }
@@ -52,11 +56,8 @@ pub enum Error {
 
 /// What to do with an inbound proof request.
 enum RequestOutcome {
-    /// First valid proof from this peer; deliver it.
     Deliver(Bytes),
-    /// Already accepted a proof from this peer this session.
     Ignore,
-    /// Reject and disconnect (malformed).
     Reject(&'static str),
 }
 
@@ -150,6 +151,7 @@ impl Behaviour {
         match event {
             request_response::Event::Message {
                 peer,
+                connection_id,
                 message:
                     Message::Request {
                         request, channel, ..
@@ -163,6 +165,7 @@ impl Behaviour {
                     RequestOutcome::Deliver(proof_bytes) => {
                         Some(ToSwarm::GenerateEvent(Event::ProofReceived {
                             peer,
+                            connection_id,
                             proof_bytes,
                         }))
                     }
@@ -171,10 +174,10 @@ impl Behaviour {
                         None
                     }
                     RequestOutcome::Reject(reason) => {
-                        warn!(%peer, reason, "Rejecting validator proof, closing connection");
+                        warn!(%peer, %connection_id, reason, "Rejecting validator proof, closing originating connection");
                         Some(ToSwarm::CloseConnection {
                             peer_id: peer,
-                            connection: CloseConnection::All,
+                            connection: CloseConnection::One(connection_id),
                         })
                     }
                 }

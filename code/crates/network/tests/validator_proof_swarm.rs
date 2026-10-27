@@ -76,7 +76,7 @@ async fn proof_delivered_once_over_real_swarm() {
             tokio::select! {
                 _ = sender.select_next_some() => {}
                 event = receiver.select_next_some() => {
-                    if let SwarmEvent::Behaviour(Event::ProofReceived { peer, proof_bytes }) = event {
+                    if let SwarmEvent::Behaviour(Event::ProofReceived { peer, proof_bytes, .. }) = event {
                         break (peer, proof_bytes);
                     }
                 }
@@ -192,6 +192,142 @@ async fn malformed_request_disconnects_peer() {
     .expect("timed out waiting for the malformed peer to be disconnected");
 
     assert!(closed);
+}
+
+/// A malformed request on one of two connections to the same peer must
+/// close only the originating connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_request_closes_only_originating_connection() {
+    let mut sender = build_oversized_sender();
+    let sender_id = *sender.local_peer_id();
+
+    let mut receiver = build_swarm();
+    receiver
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    let receiver_id = *receiver.local_peer_id();
+    let addr = wait_listen_addr(&mut receiver).await;
+
+    sender.dial(addr.clone()).unwrap();
+
+    // Wait until the first connection is established.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                event = sender.select_next_some() => {
+                    if matches!(event, SwarmEvent::ConnectionEstablished {
+                        num_established, ..
+                    } if num_established.get() == 1) {
+                        break;
+                    }
+                }
+                _ = receiver.select_next_some() => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the first connection");
+
+    // Open a second independent connection to the same peer.
+    sender
+        .dial(dial_new_connection(receiver_id, &addr))
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                event = sender.select_next_some() => {
+                    if matches!(event, SwarmEvent::ConnectionEstablished {
+                        num_established, ..
+                    } if num_established.get() == 2) {
+                        break;
+                    }
+                }
+                _ = receiver.select_next_some() => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the second connection");
+
+    // Send one oversized/malformed request.
+    sender
+        .behaviour_mut()
+        .send_request(&receiver_id, Bytes::from(vec![0u8; 2048]));
+
+    // The malformed request must close one connection, leaving one alive.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                event = sender.select_next_some() => {
+                    if let SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        num_established,
+                        cause,
+                        ..
+                    } = event
+                    {
+                        if peer_id == receiver_id {
+                            assert!(
+                                !matches!(cause, Some(ConnectionError::KeepAliveTimeout)),
+                                "connection closed because of an idle timeout"
+                            );
+                            assert_eq!(
+                                num_established, 1,
+                                "closing the malformed connection must leave one connection"
+                            );
+                            break;
+                        }
+                    }
+                }
+                event = receiver.select_next_some() => {
+                    if let SwarmEvent::Behaviour(Event::ProofReceived { .. }) = event {
+                        panic!("malformed request must not be delivered as a proof");
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for exactly one connection to close");
+
+    // Drive both swarms to ensure at least one connection remains open.
+    let settle = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::select! {
+                event = sender.select_next_some() => {
+                    if let SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        num_established,
+                        ..
+                    } = event
+                    {
+                        if peer_id == receiver_id && num_established == 0 {
+                            panic!("all connections to the receiver were closed");
+                        }
+                    }
+                }
+                event = receiver.select_next_some() => {
+                    if let SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        num_established,
+                        ..
+                    } = event
+                    {
+                        if peer_id == sender_id && num_established == 0 {
+                            panic!("all connections to the sender were closed");
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        settle.is_err(),
+        "expected one connection to remain open during the settling period"
+    );
 }
 
 fn build_oversized_sender() -> Swarm<request_response::Behaviour<OversizedCodec>> {

@@ -731,7 +731,11 @@ where
                             })?;
                     }
 
-                    NetworkEvent::ValidatorProofReceived { peer_id, proof } => {
+                    NetworkEvent::ValidatorProofReceived {
+                        peer_id,
+                        connection_id,
+                        proof,
+                    } => {
                         use malachitebft_network::validator_proof::ProofVerificationResult;
 
                         // Note: peer_id match is already verified in network layer
@@ -764,6 +768,7 @@ where
                         // Send verification result to network layer
                         if let Err(e) = self.network.cast(NetworkMsg::ValidatorProofVerified {
                             peer_id,
+                            connection_id,
                             result,
                             public_key: public_key_bytes,
                         }) {

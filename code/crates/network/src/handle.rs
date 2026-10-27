@@ -135,12 +135,14 @@ impl CtrlHandle {
     pub async fn validator_proof_verified(
         &self,
         peer_id: crate::PeerId,
+        connection_id: libp2p::swarm::ConnectionId,
         result: validator_proof::ProofVerificationResult,
         public_key: Option<Vec<u8>>,
     ) -> Result<(), eyre::Report> {
         self.tx_ctrl
             .send(CtrlMsg::ValidatorProofVerified {
                 peer_id,
+                connection_id,
                 result,
                 public_key,
             })

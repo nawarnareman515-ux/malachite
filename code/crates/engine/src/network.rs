@@ -124,6 +124,7 @@ pub enum NetworkEvent<Ctx: Context> {
     /// A validator proof received from a peer (one-way, no response expected).
     ValidatorProofReceived {
         peer_id: PeerId,
+        connection_id: libp2p::swarm::ConnectionId,
         proof: ValidatorProof<Ctx>,
     },
 
@@ -219,6 +220,7 @@ pub enum Msg<Ctx: Context> {
     /// If result is Valid and public_key is Some, stores the proof for this peer.
     ValidatorProofVerified {
         peer_id: PeerId,
+        connection_id: libp2p::swarm::ConnectionId,
         result: ProofVerificationResult,
         /// Public key bytes from verified proof (only set on Valid)
         public_key: Option<Vec<u8>>,
@@ -545,6 +547,7 @@ where
 
             Msg::NewEvent(Event::ValidatorProofReceived {
                 peer_id,
+                connection_id,
                 proof_bytes,
             }) => {
                 let proof: ValidatorProof<Ctx> = match self.codec.decode(proof_bytes) {
@@ -564,13 +567,22 @@ where
                         "Validator proof peer_id does not match sender, rejecting"
                     );
                     ctrl_handle
-                        .validator_proof_verified(peer_id, ProofVerificationResult::Invalid, None)
+                        .validator_proof_verified(
+                            peer_id,
+                            connection_id,
+                            ProofVerificationResult::Invalid,
+                            None,
+                        )
                         .await?;
                     return Ok(());
                 }
 
                 debug!(%peer_id, public_key = %hex::encode(&proof.public_key), "Received validator proof");
-                output_port.send(NetworkEvent::ValidatorProofReceived { peer_id, proof });
+                output_port.send(NetworkEvent::ValidatorProofReceived {
+                    peer_id,
+                    connection_id,
+                    proof,
+                });
             }
 
             Msg::NewEvent(Event::Sync(raw_msg)) => match raw_msg {
@@ -660,12 +672,13 @@ where
 
             Msg::ValidatorProofVerified {
                 peer_id,
+                connection_id,
                 result,
                 public_key,
             } => {
                 debug!(%peer_id, ?result, public_key = ?public_key.as_ref().map(hex::encode), "Sending validator proof verification result");
                 ctrl_handle
-                    .validator_proof_verified(peer_id, result, public_key)
+                    .validator_proof_verified(peer_id, connection_id, result, public_key)
                     .await?;
             }
 

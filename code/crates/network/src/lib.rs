@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::ops::ControlFlow;
 use std::time::Duration;
@@ -6,7 +7,7 @@ use futures::StreamExt;
 use itertools::Itertools;
 use libp2p::metrics::{Metrics, Recorder};
 use libp2p::request_response::{InboundRequestId, OutboundRequestId};
-use libp2p::swarm::{self, SwarmEvent};
+use libp2p::swarm::{self, ConnectionId, SwarmEvent};
 use libp2p::{gossipsub, identify, quic, SwarmBuilder};
 use libp2p_broadcast as broadcast;
 use tokio::sync::{mpsc, oneshot};
@@ -376,6 +377,7 @@ pub enum Event {
     /// A validator proof received from a peer (one-way, no response expected).
     ValidatorProofReceived {
         peer_id: PeerId,
+        connection_id: ConnectionId,
         proof_bytes: Bytes,
     },
 }
@@ -394,6 +396,7 @@ pub enum CtrlMsg {
     /// The public_key is stored and used to check validator set membership.
     ValidatorProofVerified {
         peer_id: PeerId,
+        connection_id: ConnectionId,
         result: validator_proof::ProofVerificationResult,
         public_key: Option<Vec<u8>>,
     },
@@ -579,6 +582,9 @@ async fn run(
         };
     }
 
+    // Track the exact active libp2p connection for each connection ID.
+    let mut active_connections: HashMap<ConnectionId, libp2p::PeerId> = HashMap::new();
+
     // Timer to perform periodic network operations (peer reconnection, metrics updates, etc.)
     let mut periodic_timer = tokio::time::interval(PERIODIC_TICK);
     let mut periodic_tick_count: u32 = 0;
@@ -586,7 +592,7 @@ async fn run(
     loop {
         let result = tokio::select! {
             event = swarm.select_next_some() => {
-                handle_swarm_event(event, &config, &metrics, &mut swarm, &mut state, &tx_event).await
+                handle_swarm_event(event, &config, &metrics, &mut swarm, &mut state, &mut active_connections, &tx_event).await
             }
 
             Some(connection_data) = state.discovery.controller.dial.recv(), if state.discovery.can_dial() => {
@@ -610,7 +616,7 @@ async fn run(
             }
 
             Some(ctrl) = rx_ctrl.recv() => {
-                handle_ctrl_msg(&mut swarm, &mut state, &config, ctrl).await
+                handle_ctrl_msg(&mut swarm, &mut state, &config, &active_connections, ctrl).await
             }
 
             _ = periodic_timer.tick() => {
@@ -642,10 +648,19 @@ async fn run(
     }
 }
 
+fn is_active_connection(
+    active_connections: &HashMap<ConnectionId, libp2p::PeerId>,
+    connection_id: ConnectionId,
+    peer_id: libp2p::PeerId,
+) -> bool {
+    active_connections.get(&connection_id) == Some(&peer_id)
+}
+
 async fn handle_ctrl_msg(
     swarm: &mut swarm::Swarm<Behaviour>,
     state: &mut State,
     config: &Config,
+    active_connections: &HashMap<ConnectionId, libp2p::PeerId>,
     msg: CtrlMsg,
 ) -> ControlFlow<()> {
     match msg {
@@ -768,33 +783,33 @@ async fn handle_ctrl_msg(
 
         CtrlMsg::ValidatorProofVerified {
             peer_id,
+            connection_id,
             result,
             public_key,
         } => {
             let libp2p_peer_id = peer_id.to_libp2p();
 
-            // Disconnect on verification failure
-            if !result.is_valid() {
-                warn!(%peer_id, "Invalid validator proof, disconnecting peer");
-                let _ = swarm.disconnect_peer_id(libp2p_peer_id);
+            // A verdict is valid only for the exact connection that delivered the proof.
+            if !is_active_connection(active_connections, connection_id, libp2p_peer_id) {
+                trace!(%peer_id, %connection_id, "Ignoring stale validator proof verdict");
                 return ControlFlow::Continue(());
             }
 
-            // If signature is valid, store the proof and check validator set membership.
-            // Close is handled on the swarm loop while this verdict is outstanding;
-            // do not buffer a key for a peer that has already gone.
-            if let Some(public_key) = public_key {
-                let connected = swarm.is_connected(&libp2p_peer_id);
-                if connected {
-                    if let Some(new_score) =
-                        state.record_verified_proof(&libp2p_peer_id, public_key)
-                    {
-                        set_peer_score(swarm, libp2p_peer_id, new_score);
-                    }
+            // Close only the connection that supplied the invalid proof.
+            if !result.is_valid() {
+                warn!(%peer_id, %connection_id, "Invalid validator proof, closing originating connection");
+                let _ = swarm.close_connection(connection_id);
+                return ControlFlow::Continue(());
+            }
 
-                    // Promote newly verified validator from ephemeral to inbound
-                    state.try_prioritize_peer(libp2p_peer_id);
+            // Store the verified key only while its originating connection is still active.
+            if let Some(public_key) = public_key {
+                if let Some(new_score) = state.record_verified_proof(&libp2p_peer_id, public_key) {
+                    set_peer_score(swarm, libp2p_peer_id, new_score);
                 }
+
+                // Promote newly verified validator from ephemeral to inbound.
+                state.try_prioritize_peer(libp2p_peer_id);
             }
 
             ControlFlow::Continue(())
@@ -883,6 +898,7 @@ async fn handle_swarm_event(
     metrics: &Metrics,
     swarm: &mut swarm::Swarm<Behaviour>,
     state: &mut State,
+    active_connections: &mut HashMap<ConnectionId, libp2p::PeerId>,
     tx_event: &mpsc::Sender<Event>,
 ) -> ControlFlow<()> {
     if let SwarmEvent::Behaviour(NetworkEvent::GossipSub(e)) = &event {
@@ -908,6 +924,7 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
+            active_connections.insert(connection_id, peer_id);
             trace!("Connected to {peer_id} with connection id {connection_id}");
 
             // Set a low default score immediately for gossipsub mesh formation
@@ -946,6 +963,7 @@ async fn handle_swarm_event(
             cause,
             ..
         } => {
+            active_connections.remove(&connection_id);
             debug!(
                 "SwarmEvent::ConnectionClosed: peer_id={}, connection_id={}, num_established={}",
                 peer_id, connection_id, num_established
@@ -1387,11 +1405,16 @@ async fn handle_validator_proof_event(
     tx_event: &mpsc::Sender<Event>,
 ) -> ControlFlow<()> {
     match event {
-        validator_proof::Event::ProofReceived { peer, proof_bytes } => {
-            // Forward to engine for verification
+        validator_proof::Event::ProofReceived {
+            peer,
+            connection_id,
+            proof_bytes,
+        } => {
+            // Forward the originating connection ID with the proof for race-safe verification.
             if let Err(e) = tx_event
                 .send(Event::ValidatorProofReceived {
                     peer_id: PeerId::from_libp2p(&peer),
+                    connection_id,
                     proof_bytes,
                 })
                 .await
@@ -1564,6 +1587,7 @@ mod tests {
 
         let event = validator_proof::Event::ProofReceived {
             peer: libp2p::PeerId::random(),
+            connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
             proof_bytes: Bytes::new(),
         };
 
@@ -1578,6 +1602,7 @@ mod tests {
         let peer = libp2p::PeerId::random();
         let event = validator_proof::Event::ProofReceived {
             peer,
+            connection_id: libp2p::swarm::ConnectionId::new_unchecked(2),
             proof_bytes: Bytes::from_static(b"proof"),
         };
 
@@ -1589,7 +1614,9 @@ mod tests {
             Event::ValidatorProofReceived {
                 peer_id,
                 proof_bytes,
+                connection_id,
             } => {
+                assert_eq!(connection_id, libp2p::swarm::ConnectionId::new_unchecked(2));
                 assert_eq!(peer_id, PeerId::from_libp2p(&peer));
                 assert_eq!(proof_bytes.as_ref(), b"proof");
             }
@@ -1597,6 +1624,115 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn handle_ctrl_msg_ignores_stale_valid_validator_proof_verdict() {
+        let config = gossip_test_config();
+        let identity = NetworkIdentity::new(
+            "test-node".to_string(),
+            libp2p::identity::Keypair::generate_ed25519(),
+            None,
+        );
+
+        let mut registry = malachitebft_metrics::Registry::default();
+        let behaviour = Behaviour::new_with_metrics(&config, &identity, &mut registry).unwrap();
+
+        let mut swarm = SwarmBuilder::with_existing_identity(identity.keypair.clone())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::new().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .unwrap()
+            .with_dns()
+            .unwrap()
+            .with_behaviour(|_| behaviour)
+            .unwrap()
+            .with_swarm_config(|cfg| config.apply_to_swarm(cfg))
+            .build();
+
+        let mut state = test_state();
+        let peer = libp2p::PeerId::random();
+        let old_connection = ConnectionId::new_unchecked(10);
+        let new_connection = ConnectionId::new_unchecked(11);
+
+        // Only the new connection is active for this peer.
+        let active_connections = HashMap::from([(new_connection, peer)]);
+
+        let pending_before = state.pending_verified_proofs.clone();
+
+        let result = handle_ctrl_msg(
+            &mut swarm,
+            &mut state,
+            &config,
+            &active_connections,
+            CtrlMsg::ValidatorProofVerified {
+                peer_id: PeerId::from_libp2p(&peer),
+                connection_id: old_connection,
+                result: validator_proof::ProofVerificationResult::Valid,
+                public_key: Some(vec![1, 2, 3]),
+            },
+        )
+        .await;
+
+        assert!(matches!(result, ControlFlow::Continue(())));
+        assert_eq!(state.pending_verified_proofs, pending_before);
+    }
+
+    #[tokio::test]
+    async fn handle_ctrl_msg_ignores_stale_invalid_validator_proof_verdict() {
+        let config = gossip_test_config();
+        let identity = NetworkIdentity::new(
+            "test-node".to_string(),
+            libp2p::identity::Keypair::generate_ed25519(),
+            None,
+        );
+
+        let mut registry = malachitebft_metrics::Registry::default();
+        let behaviour = Behaviour::new_with_metrics(&config, &identity, &mut registry).unwrap();
+
+        let mut swarm = SwarmBuilder::with_existing_identity(identity.keypair.clone())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::new().nodelay(true),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .unwrap()
+            .with_dns()
+            .unwrap()
+            .with_behaviour(|_| behaviour)
+            .unwrap()
+            .with_swarm_config(|cfg| config.apply_to_swarm(cfg))
+            .build();
+
+        let mut state = test_state();
+        let peer = libp2p::PeerId::random();
+        let old_connection = ConnectionId::new_unchecked(10);
+        let new_connection = ConnectionId::new_unchecked(11);
+
+        // Only the new connection is active for this peer.
+        let active_connections = HashMap::from([(new_connection, peer)]);
+
+        let pending_before = state.pending_verified_proofs.clone();
+
+        let result = handle_ctrl_msg(
+            &mut swarm,
+            &mut state,
+            &config,
+            &active_connections,
+            CtrlMsg::ValidatorProofVerified {
+                peer_id: PeerId::from_libp2p(&peer),
+                connection_id: old_connection,
+                result: validator_proof::ProofVerificationResult::Invalid,
+                public_key: Some(vec![1, 2, 3]),
+            },
+        )
+        .await;
+
+        assert!(matches!(result, ControlFlow::Continue(())));
+        assert_eq!(state.pending_verified_proofs, pending_before);
+    }
     #[test]
     fn sync_subscribe_reannounce_skips_when_sync_is_disabled() {
         assert!(!sync_subscribe_reannounce_on_open(false, 2));
@@ -1680,4 +1816,58 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
     }
+
+    #[test]
+    fn validator_proof_verdict_requires_matching_active_connection_and_peer() {
+        let peer = libp2p::PeerId::random();
+        let other_peer = libp2p::PeerId::random();
+        let old_connection = ConnectionId::new_unchecked(1);
+        let new_connection = ConnectionId::new_unchecked(2);
+
+        let mut active_connections = HashMap::new();
+        active_connections.insert(new_connection, peer);
+
+        assert!(!is_active_connection(
+            &active_connections,
+            old_connection,
+            peer,
+        ));
+
+        assert!(!is_active_connection(
+            &active_connections,
+            new_connection,
+            other_peer,
+        ));
+
+        assert!(is_active_connection(
+            &active_connections,
+            new_connection,
+            peer,
+        ));
+    }
+}
+#[test]
+fn active_connection_must_match_both_connection_id_and_peer() {
+    let peer = libp2p::PeerId::random();
+    let other_peer = libp2p::PeerId::random();
+
+    let connection = ConnectionId::new_unchecked(42);
+    let active_connections = HashMap::from([(connection, peer)]);
+
+    // The originating connection and peer match.
+    assert!(is_active_connection(&active_connections, connection, peer,));
+
+    // The connection is active, but belongs to a different peer.
+    assert!(!is_active_connection(
+        &active_connections,
+        connection,
+        other_peer,
+    ));
+
+    // The peer matches, but the connection is no longer active.
+    assert!(!is_active_connection(
+        &active_connections,
+        ConnectionId::new_unchecked(43),
+        peer,
+    ));
 }
