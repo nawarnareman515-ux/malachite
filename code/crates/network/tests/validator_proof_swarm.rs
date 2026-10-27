@@ -59,9 +59,9 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proof_delivered_once_over_real_swarm() {
     let mut sender = build_swarm();
+    let sender_id = *sender.local_peer_id();
     let proof = Bytes::from_static(b"validator-proof-bytes");
     sender.behaviour_mut().set_proof(proof.clone());
-    let sender_id = *sender.local_peer_id();
 
     let mut receiver = build_swarm();
     receiver
@@ -199,7 +199,6 @@ async fn malformed_request_disconnects_peer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_request_closes_only_originating_connection() {
     let mut sender = build_oversized_sender();
-    let sender_id = *sender.local_peer_id();
 
     let mut receiver = build_swarm();
     receiver
@@ -290,7 +289,6 @@ async fn malformed_request_closes_only_originating_connection() {
     })
     .await
     .expect("timed out waiting for exactly one connection to close");
-
 }
 
 fn build_oversized_sender() -> Swarm<request_response::Behaviour<OversizedCodec>> {
